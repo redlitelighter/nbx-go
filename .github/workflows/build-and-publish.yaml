@@ -1,0 +1,348 @@
+# Build and Publish — local EAS builds plus store submission for TestFlight and
+# the Play internal track.
+#
+# Both build jobs run against the "release" GitHub Environment, which is where
+# every secret below lives — including the Apple distribution certificate and
+# provisioning profile. Keeping them in a protected environment (rather than at
+# repository level) is deliberate: environment secrets are only exposed to jobs
+# that declare that environment, so they can be gated behind protection rules.
+# See docs/RELEASE.md.
+#
+# Separately, and despite the environment's name: distribution never goes to a
+# production store listing — iOS uploads land in TestFlight and Android submits
+# to the Play "internal" track (configured in eas.json).
+#
+# The Android job ends with an explicit credential cleanup step. Checkout's
+# default `git clean -ffdx` does remove the untracked keystore, credentials.json
+# and .env — but only at the start of the *next* run, and the Android job runs
+# on a self-hosted runner where that leaves them readable on disk in between.
+# The iOS job needs no equivalent: `macos-26-xlarge` is GitHub-hosted and torn
+# down when the job ends.
+#
+# Every third-party action is pinned to a full commit SHA rather than a tag,
+# since those steps run in the same job as the decoded signing material. See
+# .github/dependabot.yml, which is what keeps the pins current.
+#
+# See docs/RELEASE.md for the secret inventory and one-time setup.
+name: Build and Publish
+run-name: 🟡 Build for ${{ inputs.buildTarget }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildTarget:
+        description: "Build target: stores = Android + iOS, or a single platform"
+        required: true
+        default: stores
+        type: choice
+        options:
+          - stores
+          - android
+          - ios
+      pushTag:
+        description: Push a dated git tag after successful builds
+        required: false
+        default: true
+        type: boolean
+
+# Queue rather than cancel: a cancelled run can leave a half-finished store
+# submission behind.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Read-only by default. Only push-tag writes to the repository, and it raises
+# its own permission to `contents: write` at the job level.
+permissions:
+  contents: read
+
+env:
+  EXPO_NO_TELEMETRY: "1"
+
+jobs:
+  android:
+    name: Android → Play internal
+    if: ${{ inputs.buildTarget == 'android' || inputs.buildTarget == 'stores' }}
+    runs-on: app-build-linux-x64
+    environment: release
+    # Job-level rather than step-level: a composite action's inner steps do not
+    # reliably see `env:` set on the `uses:` step that calls it, but they do
+    # inherit the job environment. Consumed by ./.github/actions/write-dotenv.
+    env:
+      # App identity — read by app.config.js at prebuild time, not inlined
+      # into the JS bundle by babel like the EXPO_PUBLIC_* values below.
+      # Still needs to be a real secret here: write-dotenv writes it to
+      # disk the same way, since `eas build --local` runs in a copy of the
+      # project where nothing outside that file is guaranteed visible.
+      IOS_BUNDLE_IDENTIFIER: ${{ secrets.IOS_BUNDLE_IDENTIFIER }}
+      ANDROID_PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+      EXPO_PUBLIC_BTC_PROVIDER: ${{ secrets.EXPO_PUBLIC_BTC_PROVIDER }}
+      EXPO_PUBLIC_BTC_NETWORK_LABEL: ${{ secrets.EXPO_PUBLIC_BTC_NETWORK_LABEL }}
+      EXPO_PUBLIC_EVM_ETHEREUM_PROVIDER: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_PROVIDER }}
+      EXPO_PUBLIC_EVM_ETHEREUM_BUNDLER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_BUNDLER_URL }}
+      EXPO_PUBLIC_EVM_ETHEREUM_PAYMASTER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_PAYMASTER_URL }}
+      EXPO_PUBLIC_EVM_ETHEREUM_NETWORK_LABEL: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_NETWORK_LABEL }}
+      EXPO_PUBLIC_EVM_ARBITRUM_PROVIDER: ${{ secrets.EXPO_PUBLIC_EVM_ARBITRUM_PROVIDER }}
+      EXPO_PUBLIC_EVM_ARBITRUM_BUNDLER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ARBITRUM_BUNDLER_URL }}
+      EXPO_PUBLIC_EVM_ARBITRUM_PAYMASTER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ARBITRUM_PAYMASTER_URL }}
+      EXPO_PUBLIC_EVM_POLYGON_PROVIDER: ${{ secrets.EXPO_PUBLIC_EVM_POLYGON_PROVIDER }}
+      EXPO_PUBLIC_EVM_POLYGON_BUNDLER_URL: ${{ secrets.EXPO_PUBLIC_EVM_POLYGON_BUNDLER_URL }}
+      EXPO_PUBLIC_EVM_POLYGON_PAYMASTER_URL: ${{ secrets.EXPO_PUBLIC_EVM_POLYGON_PAYMASTER_URL }}
+      EXPO_PUBLIC_EVM_DELEGATION_ADDRESS: ${{ secrets.EXPO_PUBLIC_EVM_DELEGATION_ADDRESS }}
+      EXPO_PUBLIC_COINGECKO_API_KEY: ${{ secrets.EXPO_PUBLIC_COINGECKO_API_KEY }}
+      EXPO_PUBLIC_WDK_INDEXER_API_KEY: ${{ secrets.EXPO_PUBLIC_WDK_INDEXER_API_KEY }}
+      EXPO_PUBLIC_CLOUDKIT_CONTAINER_ID: ${{ secrets.EXPO_PUBLIC_CLOUDKIT_CONTAINER_ID }}
+      EXPO_PUBLIC_CLOUDKIT_API_TOKEN: ${{ secrets.EXPO_PUBLIC_CLOUDKIT_API_TOKEN }}
+      EXPO_PUBLIC_CLOUDKIT_CALLBACK_URL: ${{ secrets.EXPO_PUBLIC_CLOUDKIT_CALLBACK_URL }}
+      EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID }}
+      EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID }}
+    steps:
+      # The self-hosted image ships several toolchains this build never uses and
+      # a release AAB build needs the headroom.
+      - name: Cleanup disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/julia* || true
+          sudo rm -rf /opt/microsoft /opt/google || true
+          sudo rm -rf /opt/az || true
+          sudo rm -rf /usr/local/share/powershell || true
+          docker system prune -af || true
+          docker builder prune -af || true
+          df -h
+
+      - name: Check out Git repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: ./.github/actions/setup-eas
+
+      - name: Install dependencies
+        # Also runs `postinstall` → `wdk-worklet-bundler generate`, which writes
+        # .wdk-bundle/wdk-worklet.bundle.js. Needed on the host so the EAS CLI
+        # can evaluate app.config.js before starting the build.
+        run: npm ci
+
+      - name: Setup Java 17
+        # docs/ENVIRONMENT.md: JDK 21/24 break Android codegen for this project.
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+
+      - uses: ./.github/actions/write-dotenv
+
+      - name: Decode Android signing credentials
+        env:
+          GOOGLE_PLAY_KEYSTORE: ${{ secrets.GOOGLE_PLAY_KEYSTORE }}
+          CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
+        run: |
+          set -euo pipefail
+          # Written before `eas build`, which runs prebuild *without* --clean, so
+          # these survive into the generated android/ directory.
+          mkdir -p android/keystores
+          echo "$GOOGLE_PLAY_KEYSTORE" | base64 -d > android/keystores/release.keystore
+          echo "$CREDENTIALS_JSON" | base64 -d > credentials.json
+
+      - name: Build AAB
+        id: build
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+          EAS_PROJECT_SLUG: ${{ secrets.EAS_PROJECT_SLUG }}
+        run: |
+          set -euo pipefail
+          export NODE_OPTIONS="--max-old-space-size=4096"
+          mkdir -p artifacts
+          ARTIFACT="$GITHUB_WORKSPACE/artifacts/app-release.aab"
+          # Piped through grep to drop eas-cli-local-build-plugin's very
+          # noisy per-file logging, which otherwise buries the real build
+          # output. `set -o pipefail` above means a failing `eas build`
+          # still fails this step despite the pipe.
+          eas build \
+            --platform android \
+            --profile production \
+            --local \
+            --non-interactive \
+            --output "$ARTIFACT" \
+            2>&1 | grep -v 'eas-cli-local-build-plugin'
+          test -f "$ARTIFACT"
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-app-release.aab
+          path: ${{ steps.build.outputs.artifact }}
+          if-no-files-found: error
+
+      - name: Submit to Google Play
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+          EAS_PROJECT_SLUG: ${{ secrets.EAS_PROJECT_SLUG }}
+          # Raw JSON, not base64 — this is the one credential that is not encoded.
+          GOOGLE_SERVICE_ACCOUNT_KEY_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY_JSON }}
+        run: |
+          set -euo pipefail
+          # Path must match submit.production.android.serviceAccountKeyPath in eas.json.
+          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_KEY_JSON" > google-service-account.json
+          eas submit \
+            --platform android \
+            --profile production \
+            --path "${{ steps.build.outputs.artifact }}" \
+            --non-interactive
+
+      # This runner is not ephemeral, so nothing here can be left for the next
+      # run's `git clean` to deal with. Last step in the job and `always()`, so
+      # a failed build is cleaned up too.
+      #
+      # The temp sweep is a safety net rather than the usual path:
+      # eas-cli-local-build-plugin removes its own workingdir in a `finally`,
+      # but a cancelled or OOM-killed run leaves behind a full copy of the
+      # project — keystore included. The path comes from `env-paths`, which on
+      # Linux is <tmpdir>/<username>/eas-build-local-nodejs; the username
+      # segment is why this is a glob and not a literal.
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f credentials.json google-service-account.json .env
+          rm -rf android/keystores
+          rm -rf "${TMPDIR:-/tmp}"/*/eas-build-local-nodejs \
+                 "${TMPDIR:-/tmp}"/eas-build-local-nodejs || true
+
+  ios:
+    name: iOS → TestFlight
+    if: ${{ inputs.buildTarget == 'ios' || inputs.buildTarget == 'stores' }}
+    runs-on: macos-26-xlarge
+    environment: release
+    # See the note on the android job — job-level so the write-dotenv composite
+    # action's inner steps inherit these.
+    env:
+      # App identity — read by app.config.js at prebuild time, not inlined
+      # into the JS bundle by babel like the EXPO_PUBLIC_* values below.
+      # Still needs to be a real secret here: write-dotenv writes it to
+      # disk the same way, since `eas build --local` runs in a copy of the
+      # project where nothing outside that file is guaranteed visible.
+      IOS_BUNDLE_IDENTIFIER: ${{ secrets.IOS_BUNDLE_IDENTIFIER }}
+      ANDROID_PACKAGE_NAME: ${{ secrets.ANDROID_PACKAGE_NAME }}
+      EXPO_PUBLIC_BTC_PROVIDER: ${{ secrets.EXPO_PUBLIC_BTC_PROVIDER }}
+      EXPO_PUBLIC_BTC_NETWORK_LABEL: ${{ secrets.EXPO_PUBLIC_BTC_NETWORK_LABEL }}
+      EXPO_PUBLIC_EVM_ETHEREUM_PROVIDER: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_PROVIDER }}
+      EXPO_PUBLIC_EVM_ETHEREUM_BUNDLER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_BUNDLER_URL }}
+      EXPO_PUBLIC_EVM_ETHEREUM_PAYMASTER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_PAYMASTER_URL }}
+      EXPO_PUBLIC_EVM_ETHEREUM_NETWORK_LABEL: ${{ secrets.EXPO_PUBLIC_EVM_ETHEREUM_NETWORK_LABEL }}
+      EXPO_PUBLIC_EVM_ARBITRUM_PROVIDER: ${{ secrets.EXPO_PUBLIC_EVM_ARBITRUM_PROVIDER }}
+      EXPO_PUBLIC_EVM_ARBITRUM_BUNDLER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ARBITRUM_BUNDLER_URL }}
+      EXPO_PUBLIC_EVM_ARBITRUM_PAYMASTER_URL: ${{ secrets.EXPO_PUBLIC_EVM_ARBITRUM_PAYMASTER_URL }}
+      EXPO_PUBLIC_EVM_POLYGON_PROVIDER: ${{ secrets.EXPO_PUBLIC_EVM_POLYGON_PROVIDER }}
+      EXPO_PUBLIC_EVM_POLYGON_BUNDLER_URL: ${{ secrets.EXPO_PUBLIC_EVM_POLYGON_BUNDLER_URL }}
+      EXPO_PUBLIC_EVM_POLYGON_PAYMASTER_URL: ${{ secrets.EXPO_PUBLIC_EVM_POLYGON_PAYMASTER_URL }}
+      EXPO_PUBLIC_EVM_DELEGATION_ADDRESS: ${{ secrets.EXPO_PUBLIC_EVM_DELEGATION_ADDRESS }}
+      EXPO_PUBLIC_COINGECKO_API_KEY: ${{ secrets.EXPO_PUBLIC_COINGECKO_API_KEY }}
+      EXPO_PUBLIC_WDK_INDEXER_API_KEY: ${{ secrets.EXPO_PUBLIC_WDK_INDEXER_API_KEY }}
+      EXPO_PUBLIC_CLOUDKIT_CONTAINER_ID: ${{ secrets.EXPO_PUBLIC_CLOUDKIT_CONTAINER_ID }}
+      EXPO_PUBLIC_CLOUDKIT_API_TOKEN: ${{ secrets.EXPO_PUBLIC_CLOUDKIT_API_TOKEN }}
+      EXPO_PUBLIC_CLOUDKIT_CALLBACK_URL: ${{ secrets.EXPO_PUBLIC_CLOUDKIT_CALLBACK_URL }}
+      EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID }}
+      EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID }}
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: ./.github/actions/select-xcode
+
+      - uses: ./.github/actions/setup-eas
+
+      - name: Install dependencies
+        run: npm ci
+
+      - uses: ./.github/actions/write-dotenv
+
+      - name: Decode iOS signing credentials
+        env:
+          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+          APPLE_DISTRIBUTION_CERTIFICATE: ${{ secrets.APPLE_DISTRIBUTION_CERTIFICATE }}
+          CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
+        run: |
+          set -euo pipefail
+          mkdir -p ios/certs
+          echo "$APPLE_PROVISIONING_PROFILE" | base64 -d > ios/certs/profile.mobileprovision
+          echo "$APPLE_DISTRIBUTION_CERTIFICATE" | base64 -d > ios/certs/dist-cert.p12
+          echo "$CREDENTIALS_JSON" | base64 -d > credentials.json
+
+      - name: Build IPA
+        id: build
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+          EAS_PROJECT_SLUG: ${{ secrets.EAS_PROJECT_SLUG }}
+        run: |
+          set -euo pipefail
+          export NODE_OPTIONS="--max-old-space-size=4096"
+          mkdir -p artifacts
+          ARTIFACT="$GITHUB_WORKSPACE/artifacts/app-release.ipa"
+          # Same log filtering as the Android job — see the note there.
+          eas build \
+            --platform ios \
+            --profile production \
+            --local \
+            --non-interactive \
+            --output "$ARTIFACT" \
+            2>&1 | grep -v 'eas-cli-local-build-plugin'
+          test -f "$ARTIFACT"
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-app-release.ipa
+          path: ${{ steps.build.outputs.artifact }}
+          if-no-files-found: error
+
+      - name: Submit to TestFlight
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+          EAS_PROJECT_SLUG: ${{ secrets.EAS_PROJECT_SLUG }}
+          APPLE_APIKEY: ${{ secrets.APPLE_APIKEY }}
+          # Path must match submit.production.ios.ascApiKeyPath in eas.json.
+          EXPO_ASC_API_KEY_PATH: apple-asc-api-key.p8
+          EXPO_ASC_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          EXPO_ASC_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          EXPO_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EXPO_APPLE_TEAM_TYPE: COMPANY_OR_ORGANIZATION
+        run: |
+          set -euo pipefail
+          echo "$APPLE_APIKEY" | base64 -d > apple-asc-api-key.p8
+          eas submit \
+            --platform ios \
+            --profile production \
+            --path "${{ steps.build.outputs.artifact }}" \
+            --non-interactive
+
+  push-tag:
+    name: Push dated tag
+    needs: [android, ios]
+    # `!cancelled()` plus the explicit != 'failure' checks so a single-platform
+    # dispatch (where the other job is skipped) still tags.
+    if: ${{ !cancelled() && inputs.pushTag && needs.android.result != 'failure' && needs.ios.result != 'failure' }}
+    runs-on: ubuntu-latest
+    # The only job that writes to the repository, hence the only one that
+    # raises above the workflow-level `contents: read`.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Push dated tag
+        run: |
+          set -euo pipefail
+          TAG="build-$(date +%Y.%m.%d)-${{ github.run_number }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Pushed tag $TAG"
