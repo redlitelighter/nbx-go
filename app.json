@@ -2,7 +2,7 @@
     "expo":  {
                  "name":  "NBX-go",
                  "slug":  "wdk-starter-react-native",
-                 "version":  "0.0.4",
+                 "version":  "0.0.6",
                  "orientation":  "portrait",
                  "icon":  "./assets/images/icon.png",
                  "scheme":  "wdkstarterreactnative",
@@ -38,7 +38,7 @@
                                                    "style":  "light",
                                                    "backgroundColor":  "#000000"
                                                },
-                                 "versionCode":  4
+                                 "versionCode":  6
                              },
                  "web":  {
                              "output":  "static",

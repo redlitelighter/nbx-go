@@ -1,7 +1,7 @@
 import React from 'react';
 import { View, ScrollView, KeyboardAvoidingView, Platform, StyleSheet } from 'react-native';
 import { SafeAreaView, SafeAreaProvider, Edge, useSafeAreaInsets } from 'react-native-safe-area-context';
-import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
+import Animated, { KeyboardState, useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import { StatusBar } from 'expo-status-bar';
 import { useTheme } from '@/theme';
 
@@ -60,9 +60,15 @@ function ScreenInner({ children, scroll, noPadding, edges = ['top', 'bottom'], f
   // The keyboard height is measured from the screen's bottom edge, which
   // already includes the nav-bar inset SafeAreaView pads for — subtract it
   // so we don't double-pad.
-  const keyboardPad = useAnimatedStyle(() => ({
-    paddingBottom: Math.max(keyboard.height.value - bottomInset, 0),
-  }));
+  //
+  // Only while the keyboard is actually open: on Android the height can stay
+  // at its last value after the keyboard closes (e.g. GO opening a screen
+  // with the keyboard up), which left a blank block over the bottom half of
+  // every page that uses Screen.
+  const keyboardPad = useAnimatedStyle(() => {
+    const open = keyboard.state.value === KeyboardState.OPEN || keyboard.state.value === KeyboardState.OPENING;
+    return { paddingBottom: open ? Math.max(keyboard.height.value - bottomInset, 0) : 0 };
+  });
 
   const padding = noPadding
     ? {}

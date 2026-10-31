@@ -4,6 +4,7 @@ import { useTheme } from '@/theme';
 import { useResponsive } from '@/theme/responsive';
 import { TOKEN_ICONS } from '@/theme/assetIcons';
 import { CHAINS, networkColorFor } from '@/wdk/chains';
+import { HEDERA_ASSETS } from '@/config/hederaTokens';
 
 interface AssetIconProps {
   symbol: string;
@@ -28,7 +29,10 @@ export function AssetIcon({ symbol, network, size, showChainBadge }: AssetIconPr
   const { moderateScale } = useResponsive();
   const iconSize = size ?? moderateScale(38);
 
-  const token = TOKEN_ICONS[symbol];
+  // Hedera ecosystem tokens (SAUCE, PLEX, …) use the offline logos bundled
+  // with config/hederaTokens.ts; those are full-coin images.
+  const hts = HEDERA_ASSETS.find((t) => t.symbol === symbol.toUpperCase());
+  const token = TOKEN_ICONS[symbol] ?? (hts ? { source: hts.icon as number, hasBackground: true } : undefined);
   const chain = CHAINS[network]?.icon;
 
   // Fallback for anything not yet in the icon map — keeps the app from

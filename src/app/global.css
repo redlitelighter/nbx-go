@@ -84,12 +84,12 @@
 
   /* ---- Shared page shell ---- */
   .page-shell {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
 
   /* ---- Home ---- */
   .page-home {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
   .page-home__header {
     @apply flex-row items-center justify-between px-xl pt-xl pb-md;
@@ -134,7 +134,7 @@
 
   /* ---- Trade ---- */
   .page-trade {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
   .page-trade__tab-bar {
     @apply flex-row border-b border-[var(--color-border)] mx-xl;
@@ -164,7 +164,7 @@
 
   /* ---- Swap ---- */
   .page-swap {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
   .page-swap__card {
     @apply mx-xl mb-sm rounded-lg bg-[var(--color-bg-card)]
@@ -189,7 +189,7 @@
 
   /* ---- Profile ---- */
   .page-profile {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
   .page-profile__card {
     @apply mx-xl mt-xl rounded-lg bg-[var(--color-bg-card)]
@@ -212,7 +212,7 @@
 
   /* ---- Settings ---- */
   .page-settings {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
   .page-settings__section {
     @apply mx-xl my-md;
@@ -227,7 +227,7 @@
 
   /* ---- Models ---- */
   .page-models {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
   .page-models__banner {
     @apply mx-xl mb-md rounded-md
@@ -247,17 +247,17 @@
 
   /* ---- Onramp ---- */
   .page-onramp {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
 
   /* ---- Offramp ---- */
   .page-offramp {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
 
   /* ---- XC Chat ---- */
   .page-xc {
-    @apply flex-1 bg-[var(--color-bg-primary)];
+    @apply flex-1; /* background comes from the theme (inline), not this dark-only var */
   }
   .page-xc__header {
     @apply flex-row items-center gap-sm px-xl py-md

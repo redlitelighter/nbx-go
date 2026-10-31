@@ -21,14 +21,16 @@
  * charts get a short trend read. Voice → Whisper tiny.en → same pipeline.
  */
 import React, { useEffect, useRef, useState } from 'react';
-import { View, TextInput, ScrollView, Image, Platform, Alert, UIManager } from 'react-native';
+import { View, TextInput, ScrollView, Image, Platform, Alert, UIManager, Keyboard } from 'react-native';
 import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
+import Animated, { KeyboardState, useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import * as ImagePicker from 'expo-image-picker';
 import { Audio } from 'expo-av';
 import { X, Send, ImagePlus, Mic, Square, Sparkles, MessageSquare, LineChart, AudioLines, Cpu, Check, Download } from 'lucide-react-native';
-import { Text, Button, Tap, Going, Marker, TraceCollapsible, type MarkerStatus, type TraceTask } from '@/components';
+import { Text, Button, Tap, Going, Marker, StopBar, TraceCollapsible, type MarkerStatus, type TraceTask } from '@/components';
+import { scanFromURLAsync } from 'expo-camera';
+import { addressFromQr } from '@/components/QrScanner';
 import { useTheme } from '@/theme';
 import { ALL_ROLES, activeModel, modelSize, type QvacModelRole } from '@/config/qvacModels';
 import { allInstalled, ensureLoaded, probeQvac, refreshStatus, runCompletion, transcribeAudio, useQvac } from '@/services/qvacService';
@@ -40,7 +42,21 @@ import { useContacts } from '@/state/contacts';
 import { withoutAutoLock } from '@/state/lockSuppression';
 import { HBAR_FEE_RESERVE } from '@/hooks/useHbarForFees';
 import { HEDERA_TOKEN_BY_SYMBOL } from '@/config/hederaTokens';
-import { NBX_SLOGAN, STEP_WORDS, adviceReply, detectPersona, greeting, offTopicReply, personaReply, syn } from '@/services/goPersona';
+import {
+  NBX_SLOGAN,
+  STEP_WORDS,
+  adviceReply,
+  converse,
+  explain,
+  greeting,
+  isMore,
+  normalizeSpoken,
+  nowLine,
+  offTopicReply,
+  syn,
+  unknownQuestion,
+  type Converse,
+} from '@/services/goPersona';
 import { PATTERN_NAMES, explainPattern, findPattern } from '@/config/chartPatterns';
 import {
   CHART_DISCLAIMER,
@@ -137,11 +153,22 @@ export default function XcChatScreen() {
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const pending = useRef<Intent | null>(null);
+  // Pieces GO hasn't said yet ("tell me more"), dead ends in a row, and the
+  // address read from the last QR screenshot.
+  const more = useRef<string[]>([]);
+  const deadEnds = useRef(0);
+  const qr = useRef<{ address: string; amount?: string } | null>(null);
+  // Auto-stop for the running request: chart reading is slower than text.
+  const [workLimit, setWorkLimit] = useState(60);
   const scroll = useRef<ScrollView>(null);
   // The request in flight: its reply bubble, trace, and how to cancel it.
   const active = useRef<{ replyId: string; task: Tracer; stopped: boolean; cancel?: () => Promise<void> } | null>(null);
   const keyboard = useAnimatedKeyboard();
-  const kbStyle = useAnimatedStyle(() => ({ paddingBottom: Platform.OS === 'android' ? keyboard.height.value : 0 }));
+  // Only while the keyboard is open (Android can keep a stale height after it closes).
+  const kbStyle = useAnimatedStyle(() => {
+    const open = keyboard.state.value === KeyboardState.OPEN || keyboard.state.value === KeyboardState.OPENING;
+    return { paddingBottom: Platform.OS === 'android' && open ? keyboard.height.value : 0 };
+  });
 
   useEffect(() => {
     if (!useContacts.getState().loaded) useContacts.getState().load();
@@ -208,20 +235,34 @@ export default function XcChatScreen() {
     return { ctx, task: tracer, say };
   };
 
-  const stop = async () => {
+  const stop = async (timedOut = false) => {
     const ctx = active.current;
-    if (!ctx) return;
+    if (!ctx) return setBusy(false);
     ctx.stopped = true;
     await ctx.cancel?.();
-    update(ctx.replyId, { text: 'Stopped. Ready for the next step when you are.', going: false });
+    update(ctx.replyId, {
+      text: timedOut
+        ? 'That took too long, so I stopped it. Try again — it’s faster once the model is warm.'
+        : 'Stopped. Ready for the next step when you are.',
+      going: false,
+    });
     ctx.task.finish('stopped');
     active.current = null;
     setBusy(false);
   };
 
-  const handleText = async (text: string) => {
-    push({ role: 'user', text });
+  const handleText = async (raw: string, echo = true) => {
+    // "h bah" → HBAR, "USDT zero" → USDT0 (voice notes spell tokens as they sound).
+    const text = normalizeSpoken(raw);
+    if (echo) push({ role: 'user', text });
     const { ctx, task, say } = begin('Understanding your request');
+    /** A rule-based reply; remembers the rest of it for "tell me more". */
+    const sayConverse = (c: Extract<Converse, { kind: 'say' }>) => {
+      pending.current = null;
+      more.current = c.more ?? [];
+      task.title(c.title);
+      say(c.text);
+    };
     // Balances come from the wallet (fetched fresh when GO opens), never the model.
     const replyBalance = (asset?: string) => {
       pending.current = null;
@@ -282,10 +323,43 @@ export default function XcChatScreen() {
     };
     try {
       task.step('Reading your message');
+      // "Tell me more": the next piece of the last explanation, one at a time.
+      if (isMore(text) && more.current.length) {
+        task.title('More');
+        const [next, ...rest] = more.current;
+        more.current = rest;
+        return say(rest.length ? `${next} [[tell me more]]` : next);
+      }
+      // A QR code GO just read: send to it, or save it as a contact.
+      if (qr.current && /^\s*send to (this|that|the) address\s*$/i.test(text)) {
+        const { address, amount } = qr.current;
+        qr.current = null;
+        pending.current = { intent: 'send', slots: { recipient: address, ...(amount ? { amount: Number(amount) } : {}) } };
+        task.title('Send');
+        return say(`Sending to ${address.slice(0, 8)}…${address.slice(-6)}. Which token${amount ? '' : ' and how much'}? For example [[USDT0]] or [[5 HBAR]].`);
+      }
+      if (qr.current && /^\s*save (it )?(as )?(a )?contact\s*$/i.test(text)) {
+        const { address } = qr.current;
+        qr.current = null;
+        task.title('Save contact');
+        say('Opening Contacts — give it a name and save.');
+        router.push({ pathname: '/contacts', params: { add: address } });
+        return;
+      }
       if (!pending.current) {
-        // GO's own identity, NBX facts and business questions: persona, not the model.
-        const persona = detectPersona(text);
-        if (persona === 'advice') {
+        // Urgent help, app commands, small talk, time, GO/NBX facts: rules, not the model.
+        const c = converse(text, deadEnds.current);
+        deadEnds.current = c?.kind === 'say' && c.title === 'Standing by' ? deadEnds.current + 1 : 0;
+        if (c?.kind === 'nav') {
+          pending.current = null;
+          task.title(c.title);
+          say(c.text);
+          Keyboard.dismiss();
+          router.push(c.route as any);
+          return;
+        }
+        if (c?.kind === 'say') return sayConverse(c);
+        if (c?.kind === 'advice') {
           task.title('Crunching the numbers');
           const sym = text.match(ADVICE_TOKEN)?.[1]?.toUpperCase().replace(/^USDT$/, 'USDT0');
           const t = sym ? HEDERA_TOKEN_BY_SYMBOL[sym] : undefined;
@@ -294,17 +368,13 @@ export default function XcChatScreen() {
             const [q, week] = await Promise.all([getQuotes([t.symbol]).then((m) => m[t.symbol]), weekCloses(t.id).catch(() => [])]);
             const held = balances.data?.find((b) => b.token.symbol === t.symbol && Number(b.amount) > 0)?.amount;
             task.step('Calculating steps');
-            return say(adviceReply({ token: t.symbol, price: q?.price, change24h: q?.change24h, week, held: held ? String(Number(Number(held).toFixed(6))) : undefined }), {
+            const a = adviceReply({ token: t.symbol, price: q?.price, change24h: q?.change24h, week, held: held ? String(Number(Number(held).toFixed(6))) : undefined });
+            more.current = a.more;
+            return say(a.text, {
               items: q ? [{ symbol: t.symbol, primary: `$${q.price < 0.01 ? q.price.toPrecision(4) : q.price.toFixed(4)}`, secondary: q.change24h != null ? `${q.change24h >= 0 ? '+' : ''}${q.change24h.toFixed(2)}% 24h` : undefined }] : undefined,
             });
           }
-          return say(adviceReply({}));
-        }
-        if (persona) {
-          task.title(
-            { greeting: 'Hello', identity: 'About GO', nbx: 'About NBX', slogan: NBX_SLOGAN, pattern: 'Chart pattern' }[persona],
-          );
-          return say(personaReply(persona, text));
+          return say(adviceReply({}).text);
         }
         const bal = detectBalanceQuestion(text);
         if (bal) return replyBalance(bal.slots.token);
@@ -312,6 +382,9 @@ export default function XcChatScreen() {
         if (price) return await replyPrice(price.slots.token!);
         const hist = detectHistoryQuestion(text);
         if (hist) return await replyHistory(hist);
+        // Open-ended questions GO can explain ("what is staking?").
+        const ex = explain(text);
+        if (ex?.kind === 'say') return sayConverse(ex);
       }
 
       // Keyword fast path first ("send 5 hbar to alice", "swap 100 hbar to
@@ -328,7 +401,7 @@ export default function XcChatScreen() {
       } else {
         task.step('Thinking', 'On-device model');
         const history = [
-          { role: 'system' as const, content: XC_SYSTEM_PROMPT },
+          { role: 'system' as const, content: `${XC_SYSTEM_PROMPT}\n\nNow: ${nowLine()}.` },
           ...msgs.slice(-4).filter((m) => !m.image && m.text).map((m) => ({ role: m.role, content: m.text })),
           { role: 'user' as const, content: text },
         ];
@@ -343,7 +416,9 @@ export default function XcChatScreen() {
         intent = parsed && completeIntent(parsed, text, contacts);
       }
 
-      if (!intent) return say('Let’s take that one step at a time — say it another way, like [[buy 25 USDT of SAUCE]] or [[send 10 USDT0 to Alice]].');
+      if (!intent) {
+        return say(unknownQuestion(text) ?? 'Let’s take that one step at a time — say it another way, like [[buy 25 USDT of SAUCE]] or [[send 10 USDT0 to Alice]].');
+      }
       const token = intent.slots.token ?? intent.slots.toToken;
       task.title([TASK_TITLE[intent.intent], token].filter(Boolean).join(' ') || 'Request');
 
@@ -351,7 +426,7 @@ export default function XcChatScreen() {
         case 'refuse':
           pending.current = null;
           task.title('Out of scope');
-          return say(offTopicReply());
+          return say(unknownQuestion(text) ?? offTopicReply());
         case 'clarify':
           return say(intent.message || 'Could you say that another way?');
         case 'balance':
@@ -427,13 +502,56 @@ export default function XcChatScreen() {
     await sendText(text);
   };
 
-  const attach = async () => {
+  /** The image button asks first: a chart to read, or a QR code to use. */
+  const attach = () => {
     if (busy) return;
+    Alert.alert('What’s in the picture?', 'GO reads both on your phone — nothing is uploaded.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'QR code', onPress: () => scanQrImage() },
+      { text: 'Price chart', onPress: () => readChart() },
+    ]);
+  };
+
+  /** A screenshot of an address QR code → send to it or save it as a contact. */
+  const scanQrImage = async () => {
+    const res = await withoutAutoLock(() => ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 1 }));
+    if (res.canceled || !res.assets?.[0]) return;
+    const uri = res.assets[0].uri;
+    setBusy(true);
+    push({ role: 'user', text: 'QR code screenshot', image: uri });
+    const { ctx, task, say } = begin('QR code');
+    try {
+      task.step('Looking for a QR code', 'On your phone');
+      const found = await scanFromURLAsync(uri, ['qr']);
+      const data = found[0]?.data;
+      if (!data) return say('I couldn’t find a QR code in that picture. Crop it so the code fills most of the screenshot and try again.');
+      const address = addressFromQr(data);
+      if (!/^0x[a-fA-F0-9]{40}$/.test(address) && !/^0\.0\.\d+$/.test(address)) {
+        return say('That QR code isn’t a Hedera address, so I won’t use it. Ask the sender for their Hedera (0x… or 0.0.…) address QR.');
+      }
+      const amount = data.match(/[?&]amount=([\d.]+)/)?.[1];
+      task.step('Found a Hedera address');
+      const known = contacts.find((c) => c.addresses.some((a) => a.address.toLowerCase() === address.toLowerCase()));
+      qr.current = { address, amount };
+      say(
+        `${known ? `That’s ${known.name}’s address` : 'Found a Hedera address'}: ${address.slice(0, 8)}…${address.slice(-6)}` +
+          `${amount ? `, asking for ${amount}` : ''}. Next step — [[send to this address]]${known ? '' : ' or [[save as contact]]'}?`,
+      );
+    } catch (e: any) {
+      say(`I couldn’t read that picture: ${e?.message ?? 'scan error'}`, {}, 'error');
+    } finally {
+      if (active.current === ctx) active.current = null;
+      setBusy(false);
+    }
+  };
+
+  const readChart = async () => {
     if (!hasVision) return offerDownload('vision', 'Chart reading');
     // The system photo picker pauses our Activity — don't let that lock the wallet.
     const res = await withoutAutoLock(() => ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.8 }));
     if (res.canceled || !res.assets?.[0]) return;
     const uri = res.assets[0].uri;
+    setWorkLimit(120);
     setBusy(true);
     push({ role: 'user', text: 'Chart screenshot', image: uri });
     const { ctx, task, say } = begin('Chart analysis');
@@ -464,11 +582,19 @@ export default function XcChatScreen() {
     } finally {
       if (active.current === ctx) active.current = null;
       setBusy(false);
+      setWorkLimit(60);
     }
   };
 
-  const toggleVoice = async () => {
-    if (recording) {
+  /**
+   * Voice has its own button, separate from Send: the old shared button
+   * turned into a mic the moment a message was sent, so a second tap (or
+   * the keyboard's send) started a recording. Starting only ever happens
+   * from the mic button; stopping (button, stop bar or countdown) only stops.
+   */
+  const stopVoice = async () => {
+    if (!recording) return;
+    {
       setRecording(null);
       try {
         await recording.stopAndUnloadAsync();
@@ -480,16 +606,20 @@ export default function XcChatScreen() {
         const text = (await transcribeAudio(uri.replace(/^file:\/\//, ''))).trim();
         if (ctx.stopped) return;
         if (!text) return say('I didn’t catch that — try again a little closer to the mic.');
-        say(`“${text}”`);
+        // Shown as heard, with tokens fixed up ("h bah" → HBAR).
+        say(`Heard: “${normalizeSpoken(text)}”`);
         active.current = null;
-        await handleText(text);
+        await handleText(text, false);
       } catch (e: any) {
         push({ role: 'assistant', text: `I couldn’t transcribe that: ${e?.message ?? 'speech error'}` });
       } finally {
         setBusy(false);
       }
-      return;
     }
+  };
+
+  const startVoice = async () => {
+    if (recording || busy) return;
     if (!hasSpeech) return offerDownload('speech', 'Voice');
     const perm = await withoutAutoLock(() => Audio.requestPermissionsAsync());
     if (!perm.granted) {
@@ -555,9 +685,27 @@ export default function XcChatScreen() {
             ))}
           </ScrollView>
 
+          {/* While GO works: a pulsing stop button and a countdown that stops
+              it by itself (60 s, or 120 s for charts). Voice has no limit —
+              it records until the red stop button is tapped. */}
+          {busy && !recording ? <StopBar mode="working" seconds={workLimit} onStop={(timedOut) => stop(timedOut)} /> : null}
+
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12, backgroundColor: theme.colors.bgPrimary }}>
-            <Tap onPress={attach} disabled={busy} accessibilityLabel="Attach chart" style={{ ...round, backgroundColor: theme.colors.bgSecondary }}>
-              <ImagePlus size={20} color={busy ? theme.colors.textDisabled : theme.colors.textPrimary} />
+            <Tap onPress={attach} disabled={busy || !!recording} accessibilityLabel="Attach chart or QR code" style={{ ...round, backgroundColor: theme.colors.bgSecondary }}>
+              <ImagePlus size={20} color={busy || recording ? theme.colors.textDisabled : theme.colors.textPrimary} />
+            </Tap>
+            {/* Voice: its own button, on the left, away from Send. */}
+            <Tap
+              onPress={recording ? stopVoice : startVoice}
+              disabled={busy && !recording}
+              accessibilityLabel={recording ? 'Stop recording' : 'Record a voice note'}
+              style={{ ...round, backgroundColor: recording ? theme.colors.error : theme.colors.bgSecondary }}
+            >
+              {recording ? (
+                <Square size={14} color="#fff" fill="#fff" />
+              ) : (
+                <Mic size={20} color={busy ? theme.colors.textDisabled : theme.colors.textPrimary} />
+              )}
             </Tap>
             <TextInput
               value={input}
@@ -579,20 +727,18 @@ export default function XcChatScreen() {
             />
             {busy && !recording ? (
               // Stop: cancels the running model request.
-              <Tap onPress={stop} accessibilityLabel="Stop" style={{ ...round, backgroundColor: theme.colors.textPrimary }}>
+              <Tap onPress={() => stop()} accessibilityLabel="Stop" style={{ ...round, backgroundColor: theme.colors.textPrimary }}>
                 <Square size={14} color={theme.colors.bgPrimary} fill={theme.colors.bgPrimary} />
               </Tap>
-            ) : input.trim() ? (
-              <Tap onPress={send} accessibilityLabel="Send" style={{ ...round, backgroundColor: theme.colors.brand }}>
-                <Send size={18} color="#fff" />
-              </Tap>
             ) : (
+              // Send: text only — never records, greyed out until there's text.
               <Tap
-                onPress={toggleVoice}
-                accessibilityLabel={recording ? 'Stop recording' : 'Voice'}
-                style={{ ...round, backgroundColor: recording ? theme.colors.error : theme.colors.brand }}
+                onPress={send}
+                disabled={!input.trim() || !!recording}
+                accessibilityLabel="Send"
+                style={{ ...round, backgroundColor: input.trim() && !recording ? theme.colors.brand : theme.colors.bgSecondary }}
               >
-                {recording ? <Square size={16} color="#fff" /> : <Mic size={18} color="#fff" />}
+                <Send size={18} color={input.trim() && !recording ? '#fff' : theme.colors.textDisabled} />
               </Tap>
             )}
           </View>

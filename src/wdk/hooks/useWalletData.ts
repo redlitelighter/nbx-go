@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import BigNumber from 'bignumber.js';
-import { useBalancesForWallet, useAccount, useWalletManager } from '@tetherto/wdk-react-native-core';
+import { useAccount, useWalletManager } from '@tetherto/wdk-react-native-core';
 import { ASSETS, ASSET_MAP } from '../assets';
 import { DEFAULT_WALLET_ID } from '../walletIdentity';
 import { usePrices } from '../pricing';
@@ -52,6 +52,37 @@ function formatUsd(value: BigNumber | null): string {
   return `$${value.toFormat(2)}`;
 }
 
+const MIRROR = 'https://mainnet-public.mirrornode.hedera.com/api/v1';
+
+/** HTS token id ("0.0.n") from its long-zero ERC-20 facade address. */
+function tokenIdFromAddress(address: string): string {
+  return `0.0.${parseInt(address.replace(/^0x/i, ''), 16)}`;
+}
+
+/**
+ * One mirror-node request for every asset, shaped like WDK's balance rows
+ * (assetId, network, success, balance in the asset's base units). HBAR comes
+ * back in tinybar; the HBAR asset uses weibar (18 decimals), so ×1e10.
+ * An address the mirror node hasn't seen yet (new, never funded) is all zeros.
+ */
+async function fetchMirrorBalances(evmAddress: string) {
+  const res = await fetch(`${MIRROR}/accounts/${evmAddress}?transactions=false`);
+  const empty = res.status === 404;
+  if (!res.ok && !empty) throw new Error(`Mirror node ${res.status}`);
+  const json: any = empty ? {} : await res.json();
+  const tinybar = String(json?.balance?.balance ?? 0);
+  const tokens = new Map<string, string>(
+    (json?.balance?.tokens ?? []).map((t: any) => [t.token_id, String(t.balance)]),
+  );
+  return ASSETS.map((asset) => {
+    const address = asset.getContractAddress();
+    const balance = address
+      ? tokens.get(tokenIdFromAddress(address)) ?? '0'
+      : new BigNumber(tinybar).multipliedBy(1e10).toFixed(0);
+    return { assetId: asset.getId(), network: asset.getNetwork(), success: true, balance };
+  });
+}
+
 /**
  * Balances for a SPECIFIC account index — the shared core both the "active
  * account" hooks and the Accounts screen (which needs every account's own
@@ -70,11 +101,19 @@ export function useWdkBalancesForAccount(accountIndex: number) {
   // post-send refetch) are the other half of this fix — this staleTime
   // change means those refetches actually take effect immediately instead
   // of being skipped as "still fresh."
-  const { data, isLoading, isRefetching, error, refetch } = useBalancesForWallet(
-    accountIndex,
-    ASSETS,
-    { enabled: true, staleTime: 0 },
-  );
+  //
+  // Balances come from Hedera's mirror node, not WDK's per-asset JSON-RPC
+  // reads: Hashio answers in 5–11s under load, so eight balanceOf calls
+  // routinely timed out and every row showed "Failed". The mirror node
+  // returns HBAR and every HTS token balance in one sub-second request.
+  const hedera = useAccount({ network: 'hedera', accountIndex });
+  const { data, isLoading, isRefetching, error, refetch } = useQuery({
+    queryKey: ['hedera-balances', hedera.address],
+    queryFn: () => fetchMirrorBalances(hedera.address!),
+    enabled: !!hedera.address,
+    staleTime: 0,
+    retry: 2,
+  });
 
   const symbols = useMemo(
     () => Array.from(new Set(ASSETS.map((a) => a.getSymbol()))),
@@ -114,7 +153,7 @@ export function useWdkBalancesForAccount(accountIndex: number) {
 
   return {
     data: balances,
-    isLoading: isLoading || pricesLoading,
+    isLoading: isLoading || pricesLoading || (!hedera.address && hedera.isLoading),
     isRefetching,
     isError: !!error,
     error: error ?? null,

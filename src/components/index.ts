@@ -23,3 +23,4 @@ export { Going } from './Going';
 export { TokenPill, ExchangeCard, FlipButton, DetailsCard, DetailRow } from './Exchange';
 export { Dropdown, type DropdownOption } from './Dropdown';
 export { Popover } from './Popover';
+export { StopBar } from './StopBar';

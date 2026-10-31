@@ -38,9 +38,10 @@ function short(a: string) {
 export default function ContactsScreen() {
   const theme = useTheme();
   const router = useRouter();
-  const { pick } = useLocalSearchParams<{ pick?: string }>();
+  // `add`: an address to save as a new contact (from GO's QR reader).
+  const { pick, add } = useLocalSearchParams<{ pick?: string; add?: string }>();
   const { contacts, load, upsert, remove } = useContacts();
-  const [editing, setEditing] = useState<Contact | 'new' | null>(null);
+  const [editing, setEditing] = useState<Contact | 'new' | null>(add ? 'new' : null);
 
   useEffect(() => {
     load();
@@ -137,6 +138,7 @@ export default function ContactsScreen() {
 
       <ContactEditor
         contact={editing === 'new' ? null : editing}
+        prefill={editing === 'new' ? add : undefined}
         visible={editing !== null}
         onClose={() => setEditing(null)}
         onSave={async (c) => {
@@ -150,11 +152,14 @@ export default function ContactsScreen() {
 
 function ContactEditor({
   contact,
+  prefill,
   visible,
   onClose,
   onSave,
 }: {
   contact: Contact | null;
+  /** Hedera address to start a new contact with. */
+  prefill?: string;
   visible: boolean;
   onClose: () => void;
   onSave: (c: { id?: string; name: string; addresses: ContactAddress[] }) => Promise<void>;
@@ -171,8 +176,8 @@ function ContactEditor({
     setName(contact?.name ?? '');
     setRows(contact?.addresses ?? []);
     setNetwork('hedera');
-    setAddress('');
-  }, [visible, contact]);
+    setAddress(prefill ?? '');
+  }, [visible, contact, prefill]);
 
   const net = NETWORKS.find((n) => n.key === network)!;
   const addressValid = address.trim().length > 0 && net.validate(address.trim());
